@@ -103,7 +103,7 @@ PY
 fmt_ns() {
   python3 -c "
 ns=$1
-if   ns < 1_000:         r = f'{ns}ns'
+if   ns < 1_000:         r = f'{ns}ns    '
 elif ns < 1_000_000:     r = f'{ns/1e3:.3f}µs'
 elif ns < 1_000_000_000: r = f'{ns/1e6:.3f}ms'
 else:                    r = f'{ns/1e9:.3f}s'
@@ -272,7 +272,7 @@ run_bench() {
     w2=$(winner "$go_p2" "$zig_p2")
 
     bar_clear
-    if ! $is_first; then printf "\n"; fi
+    if ! $is_first; then printf "  %s" "$grey"; printf '─%.0s' {1..43}; printf "%s\n" "$reset"; fi
     is_first=false
     printf "  %s%-7s%s  P1  %s%s%s  %s%s%s  %s\n" \
       "$bold" "Day $day" "$reset" \
