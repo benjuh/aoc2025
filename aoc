@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GO_DIR="$SCRIPT_DIR/aoc2025-go"
+ZIG_DIR="$SCRIPT_DIR/aoc2025-zig"
+
+if [[ -t 1 ]]; then
+  bold=$'\033[1m'; reset=$'\033[0m'; green=$'\033[32m'
+  cyan=$'\033[36m'; grey=$'\033[90m'
+else
+  bold=''; reset=''; green=''; cyan=''; grey=''
+fi
+
+ITERATIONS=10
+ITERATIONS_SET=false
+SHOW_ANSWERS=false
+BENCHMARK=false
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -n|--iterations) ITERATIONS="$2"; ITERATIONS_SET=true; shift 2 ;;
+    -a|--show-answers) SHOW_ANSWERS=true; shift ;;
+    -b|--benchmark) BENCHMARK=true; shift ;;
+    -h|--help)
+      printf "usage: aoc [DAY | START-END] [-n N] [-a] [-b]\n"
+      printf "  no args / range  benchmark mode (avg × N iterations)\n"
+      printf "  single DAY       show answers\n"
+      printf "  single DAY -b    benchmark single day (default 50 iterations)\n"
+      printf "  -n, --iterations iteration count (default 10 range, 50 single -b)\n"
+      printf "  -a, --show-answers  include answers in benchmark output\n"
+      printf "  -b, --benchmark  benchmark a single day\n"
+      exit 0 ;;
+    -*) printf "unknown flag: %s\n" "$1" >&2; exit 1 ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+
+# ─── timing + formatting (python) ─────────────────────────────────────────────
+
+# bench sets globals so bash can read ITER progress tokens from the pipe.
+# Timing is parsed from the binary's own output (Part 1/2 lines) to exclude
+# process startup overhead — matching what the binary's internal timer reports.
+_bench_p1=0
+_bench_p2=0
+_bench_output=""
+
+bench() {  # <n> <cwd> <stream:stdout|stderr> <cmd...>; sets _bench_p1 _bench_p2 _bench_output
+  local n=$1 cwd=$2 stream=$3; shift 3
+  _bench_p1=0; _bench_p2=0; _bench_output=""
+  local in_output=false
+  while IFS= read -r line; do
+    if $in_output; then
+      _bench_output+="$line"$'\n'
+    elif [[ "$line" == ITER ]]; then
+      _ops_done=$(( _ops_done + 1 ))
+      bar_draw
+    elif [[ "$line" == OUTPUT_START ]]; then
+      in_output=true
+    elif [[ "$line" == P1:* ]]; then
+      _bench_p1="${line#P1:}"
+    elif [[ "$line" == P2:* ]]; then
+      _bench_p2="${line#P2:}"
+    fi
+  done < <(python3 - "$n" "$cwd" "$stream" "$@" <<'PY'
+import sys, subprocess, re
+
+def parse_ns(s):
+    m = re.match(r'^([\d.]+)(ns|µs|us|ms|s)$', s.strip())
+    if not m: return 0
+    val, unit = float(m.group(1)), m.group(2)
+    if unit == 'ns':        return int(val)
+    if unit in ('µs','us'): return int(val * 1e3)
+    if unit == 'ms':        return int(val * 1e6)
+    if unit == 's':         return int(val * 1e9)
+    return 0
+
+ansi = re.compile(r'\x1b\[[0-9;]*m')
+n, cwd, stream, cmd = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4:]
+p1_total, p2_total, first = 0, 0, ""
+for i in range(n):
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+    out = r.stderr if stream == "stderr" else r.stdout
+    clean = ansi.sub('', out)
+    for line in clean.splitlines():
+        m = re.match(r'^\s+(\S+)\s+Part (\d+):', line)
+        if m:
+            ns = parse_ns(m.group(1))
+            if m.group(2) == '1': p1_total += ns
+            else:                 p2_total += ns
+    if i == 0: first = out
+    print("ITER", flush=True)
+print(f"P1:{p1_total // n}")
+print(f"P2:{p2_total // n}")
+print("OUTPUT_START")
+sys.stdout.write(first)
+PY
+  )
+}
+
+fmt_ns() {
+  python3 -c "
+ns=$1
+if   ns < 1_000:         r = f'{ns}ns'
+elif ns < 1_000_000:     r = f'{ns/1e3:.1f}µs'
+elif ns < 1_000_000_000: r = f'{ns/1e6:.3f}ms'
+else:                    r = f'{ns/1e9:.3f}s'
+print(r)
+"
+}
+
+fmt_bytes() {
+  python3 -c "
+b=$1
+if   b < 1024:    r = f'{b}B'
+elif b < 1048576: r = f'{b/1024:.1f}KB'
+else:             r = f'{b/1048576:.1f}MB'
+print(r)
+"
+}
+
+# right/left-align string to visual width W, compensating for multi-byte chars (µ ×)
+ralign() {
+  local s=$1 w=$2
+  local clen; clen=$(printf '%s' "$s" | wc -m | tr -d ' \t\n')
+  printf "%$(( w + ${#s} - clen ))s" "$s"
+}
+lalign() {
+  local s=$1 w=$2
+  local clen; clen=$(printf '%s' "$s" | wc -m | tr -d ' \t\n')
+  printf "%-$(( w + ${#s} - clen ))s" "$s"
+}
+
+# ─── progress bar ──────────────────────────────────────────────────────────────
+
+_ops_done=0
+_ops_total=1
+
+bar_draw() {
+  local w=50 pct filled i bar=""
+  pct=$(( _ops_done * 100 / _ops_total ))
+  filled=$(( _ops_done * w / _ops_total ))
+  for ((i=0; i<filled; i++)); do bar+="█"; done
+  for ((i=filled; i<w; i++)); do bar+="░"; done
+  printf "\r  %s[%s]%s %s%3d%%%s  %s%d/%d%s" \
+    "$grey" "$bar" "$reset" \
+    "$bold" "$pct" "$reset" \
+    "$grey" "$_ops_done" "$_ops_total" "$reset"
+}
+
+bar_clear() { printf "\r\033[2K"; }
+
+# ─── build ─────────────────────────────────────────────────────────────────────
+
+GO_BIN=""
+ZIG_BIN=""
+
+do_build() {
+  printf "%sBuilding...%s " "$bold" "$reset"
+  GO_BIN="$GO_DIR/aoc2025-go-bench"
+  (cd "$GO_DIR" && go build -o "$GO_BIN" . 2>/dev/null)
+  printf "%sGo ✓%s  " "$green" "$reset"
+  (cd "$ZIG_DIR" && zig build -Doptimize=ReleaseFast 2>/dev/null)
+  ZIG_BIN="$ZIG_DIR/zig-out/bin/aoc2025-zig"
+  printf "%sZig ✓%s\n" "$green" "$reset"
+}
+
+# ─── single day (original behavior) ───────────────────────────────────────────
+
+run_single() {
+  local day=$1
+  printf "\n%sAdvent of Code 2025 — Day %s%s\n" "$bold" "$day" "$reset"
+  printf "%s" "$grey"; printf '─%.0s' {1..40}; printf "%s\n" "$reset"
+  (cd "$GO_DIR" && go run . "$day" 2>/dev/null) || printf "  Go: not implemented\n"
+  (cd "$ZIG_DIR" && zig build run -Doptimize=ReleaseFast -- "$day" 2>&1) || printf "  Zig: not implemented\n"
+}
+
+# ─── benchmark ─────────────────────────────────────────────────────────────────
+
+run_bench() {
+  local -a days=("$@")
+  local day go_p1 go_p2 zig_p1 zig_p2 go_ok zig_ok go_out zig_out go_p1_str go_p2_str zig_p1_str zig_p2_str ratio w1 w2 zig_check
+
+  do_build
+  printf "\n"
+
+  # discovery: filter to implemented days only
+  printf "%sScanning days...%s" "$grey" "$reset"
+  local -a impl_days=()
+  for day in "${days[@]}"; do
+    go_ok=false; zig_ok=false
+    (cd "$GO_DIR" && "$GO_BIN" "$day") >/dev/null 2>&1 && go_ok=true
+    zig_check=$( (cd "$ZIG_DIR" && "$ZIG_BIN" "$day") 2>&1 >/dev/null || true)
+    [[ -n "$zig_check" ]] && ! echo "$zig_check" | grep -q "not implemented" && zig_ok=true
+    ($go_ok || $zig_ok) && impl_days+=("$day")
+  done
+  printf "\r\033[2K"
+
+  if [[ ${#impl_days[@]} -eq 0 ]]; then
+    printf "  %sno implemented days in range%s\n\n" "$grey" "$reset"
+    return
+  fi
+
+  _ops_total=$(( ${#impl_days[@]} * 2 * ITERATIONS ))
+  _ops_done=0
+
+  # header
+  printf "  %s%-7s  %-2s  %s  %s  %s%s\n" \
+    "$bold" "Day" "Pt" \
+    "$(lalign "Go (avg×${ITERATIONS})" 12)" \
+    "$(lalign "Zig (avg×${ITERATIONS})" 12)" \
+    "Faster" "$reset"
+  printf "  %s" "$grey"; printf '─%.0s' {1..63}; printf "%s\n" "$reset"
+
+  bar_draw
+
+  local -a go_p1_arr=() go_p2_arr=() zig_p1_arr=() zig_p2_arr=()
+
+  for day in "${impl_days[@]}"; do
+    # detect per-day implementation status (reuse discovery results)
+    go_ok=false; zig_ok=false
+    (cd "$GO_DIR" && "$GO_BIN" "$day") >/dev/null 2>&1 && go_ok=true
+    zig_check=$( (cd "$ZIG_DIR" && "$ZIG_BIN" "$day") 2>&1 >/dev/null || true)
+    [[ -n "$zig_check" ]] && ! echo "$zig_check" | grep -q "not implemented" && zig_ok=true
+
+    # benchmark Go
+    go_p1=0; go_p2=0; go_out=""
+    if $go_ok; then
+      bench "$ITERATIONS" "$GO_DIR" "stdout" "$GO_BIN" "$day"
+      go_p1=$_bench_p1; go_p2=$_bench_p2; go_out=${_bench_output:-}
+    else
+      _ops_done=$(( _ops_done + ITERATIONS ))
+      bar_draw
+    fi
+
+    # benchmark Zig
+    zig_p1=0; zig_p2=0; zig_out=""
+    if $zig_ok; then
+      bench "$ITERATIONS" "$ZIG_DIR" "stderr" "$ZIG_BIN" "$day"
+      zig_p1=$_bench_p1; zig_p2=$_bench_p2; zig_out=${_bench_output:-}
+    else
+      _ops_done=$(( _ops_done + ITERATIONS ))
+      bar_draw
+    fi
+
+    go_p1_arr+=("$go_p1"); go_p2_arr+=("$go_p2")
+    zig_p1_arr+=("$zig_p1"); zig_p2_arr+=("$zig_p2")
+
+    # format time strings
+    if $go_ok;  then go_p1_str=$(fmt_ns "$go_p1");   go_p2_str=$(fmt_ns "$go_p2");  else go_p1_str="n/a";  go_p2_str="n/a";  fi
+    if $zig_ok; then zig_p1_str=$(fmt_ns "$zig_p1"); zig_p2_str=$(fmt_ns "$zig_p2"); else zig_p1_str="n/a"; zig_p2_str="n/a"; fi
+
+    # winner per part
+    winner() {
+      local gns=$1 zns=$2
+      if $go_ok && $zig_ok && (( gns > 0 && zns > 0 )); then
+        if (( gns <= zns )); then
+          ratio=$(python3 -c "print(f'{$zns/$gns:.2f}x')")
+          printf "%s" "${green}Go${reset} ${grey}${ratio}${reset}"
+        else
+          ratio=$(python3 -c "print(f'{$gns/$zns:.2f}x')")
+          printf "%s" "${cyan}Zig${reset} ${grey}${ratio}${reset}"
+        fi
+      elif $go_ok;  then printf "%s" "${green}Go${reset}  ${grey}only${reset}"
+      elif $zig_ok; then printf "%s" "${cyan}Zig${reset} ${grey}only${reset}"
+      fi
+    }
+    w1=$(winner "$go_p1" "$zig_p1")
+    w2=$(winner "$go_p2" "$zig_p2")
+
+    bar_clear
+    printf "  %s%-7s%s  P1  %s%s%s  %s%s%s  %s\n" \
+      "$bold" "Day $day" "$reset" \
+      "$green" "$(ralign "$go_p1_str" 12)" "$reset" \
+      "$cyan" "$(ralign "$zig_p1_str" 12)" "$reset" \
+      "$w1"
+    printf "  %-7s  P2  %s%s%s  %s%s%s  %s\n" \
+      "" \
+      "$green" "$(ralign "$go_p2_str" 12)" "$reset" \
+      "$cyan" "$(ralign "$zig_p2_str" 12)" "$reset" \
+      "$w2"
+
+    if $SHOW_ANSWERS; then
+      [[ -n "${go_out:-}"  ]] && printf '%s' "$go_out"  | sed 's/^/    /'
+      [[ -n "${zig_out:-}" ]] && printf '%s' "$zig_out" | sed 's/^/    /'
+    fi
+
+    bar_draw
+  done
+
+  bar_clear
+
+  # ─── summary ──────────────────────────────────────────────────────────────────
+  printf "  %s" "$grey"; printf '─%.0s' {1..65}; printf "%s\n" "$reset"
+
+  local go_p1_tot=0 go_p2_tot=0 zig_p1_tot=0 zig_p2_tot=0 idx
+  for idx in "${!go_p1_arr[@]}"; do
+    go_p1_tot=$(( go_p1_tot + ${go_p1_arr[$idx]} ))
+    go_p2_tot=$(( go_p2_tot + ${go_p2_arr[$idx]} ))
+    zig_p1_tot=$(( zig_p1_tot + ${zig_p1_arr[$idx]} ))
+    zig_p2_tot=$(( zig_p2_tot + ${zig_p2_arr[$idx]} ))
+  done
+
+  local go_sz zig_sz
+  go_sz=$(stat -f%z "$GO_BIN" 2>/dev/null || stat -c%s "$GO_BIN")
+  zig_sz=$(stat -f%z "$ZIG_BIN" 2>/dev/null || stat -c%s "$ZIG_BIN")
+
+  printf "  %s%-7s%s  P1  %s%s%s  %s%s%s\n" \
+    "$bold" "Total" "$reset" \
+    "$green" "$(ralign "$(fmt_ns $go_p1_tot)" 12)" "$reset" \
+    "$cyan" "$(ralign "$(fmt_ns $zig_p1_tot)" 12)" "$reset"
+  printf "  %-7s  P2  %s%s%s  %s%s%s\n" \
+    "" \
+    "$green" "$(ralign "$(fmt_ns $go_p2_tot)" 12)" "$reset" \
+    "$cyan" "$(ralign "$(fmt_ns $zig_p2_tot)" 12)" "$reset"
+
+  printf "  %s%-7s%s      %s%s%s  %s%s%s\n" \
+    "$bold" "Binary" "$reset" \
+    "$green" "$(ralign "$(fmt_bytes $go_sz)" 12)" "$reset" \
+    "$cyan" "$(ralign "$(fmt_bytes $zig_sz)" 12)" "$reset"
+
+  printf "  %s×%d iterations per day%s\n\n" "$grey" "$ITERATIONS" "$reset"
+}
+
+# ─── dispatch ──────────────────────────────────────────────────────────────────
+
+if [[ $# -lt 1 ]]; then
+  days_arr=()
+  for d in $(seq 1 25); do days_arr+=("$d"); done
+  run_bench "${days_arr[@]}"
+elif [[ "$1" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+  days_arr=()
+  for d in $(seq "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"); do days_arr+=("$d"); done
+  run_bench "${days_arr[@]}"
+else
+  if $BENCHMARK; then
+    ! $ITERATIONS_SET && ITERATIONS=50
+    run_bench "$1"
+  else
+    run_single "$1"
+  fi
+fi
